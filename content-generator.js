@@ -1,4 +1,3 @@
-javascript
 const { exec } = require('child_process');
 
 async function generateContent(clientId, profile) {
