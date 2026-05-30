@@ -34,5 +34,3 @@ function generateContent(profile) {
   for (let i = 0; i < 7; i++) posts.push(generateSinglePost(business_name, business_type, platformList[i % platformList.length], i));
   return posts;
 }
-
-module.exports = { generateContent };
