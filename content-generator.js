@@ -1,56 +1,122 @@
-const { exec } = require('child_process');
+const express = require('express');
+const cors = require('cors');
+const app = express();
+const port = process.env.PORT || 3001;
+app.use(cors());
+app.use(express.json());
 
-async function generateContent(clientId, profile) {
-  const { business_name, business_type, platforms } = profile;
-  const platformList = platforms ? platforms.split(',').map(p => p.trim()) : ['Instagram', 'Facebook', 'TikTok'];
-  const posts = [];
+// Database setup
+const Database = require('better-sqlite3');
+const DB_PATH = process.env.DB_PATH || '/tmp/autosocial.db';
+const db = new Database(DB_PATH);
 
-  for (let i = 0; i < 7; i++) {
-    const platform = platformList[i % platformList.length];
-    const post = generateSinglePost(business_name, business_type, platform, i);
-    posts.push(post);
-  }
+db.exec(`CREATE TABLE IF NOT EXISTS clients (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT, business_name TEXT, business_type TEXT, password TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+db.exec(`CREATE TABLE IF NOT EXISTS business_profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, website TEXT, brand_voice TEXT, target_audience TEXT, platforms TEXT, content_style TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+db.exec(`CREATE TABLE IF NOT EXISTS content_posts (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, platform TEXT, post_type TEXT, caption TEXT, hashtags TEXT, image_prompt TEXT, image_url TEXT, status TEXT DEFAULT 'draft', scheduled_date TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+db.exec(`CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, plan TEXT, amount REAL, status TEXT, stripe_payment_intent_id TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+db.exec(`CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, plan TEXT, amount REAL, status TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+db.exec(`CREATE TABLE IF NOT EXISTS signups (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
 
+// Seed clients if empty
+const count = db.prepare('SELECT COUNT(*) as c FROM clients').get();
+if (count.c === 0) {
+  db.prepare(`INSERT INTO clients (name, email, business_name, business_type, password) VALUES ('Sam', 'sam@fitlifecoaching.com', 'FitLife Coaching', 'Fitness Coaching', 'welcome2024')`).run();
+  db.prepare(`INSERT INTO clients (name, email, business_name, business_type, password) VALUES ('Umami Admin', 'hello@umamiramen.com', 'Umami Ramen Bar', 'Restaurant', 'welcome2024')`).run();
+  db.prepare(`INSERT INTO clients (name, email, business_name, business_type, password) VALUES ('Alex', 'alex@peakperformpt.com', 'Peak Performance PT', 'Physical Therapy', 'welcome2024')`).run();
+  db.prepare(`INSERT INTO payments (client_id, plan, amount, status) VALUES (1, 'founder', 997, 'completed')`).run();
+  db.prepare(`INSERT INTO payments (client_id, plan, amount, status) VALUES (2, 'founder', 997, 'completed')`).run();
+  db.prepare(`INSERT INTO payments (client_id, plan, amount, status) VALUES (3, 'growth', 397, 'completed')`).run();
+  db.prepare(`INSERT INTO invoices (client_id, plan, amount, status) VALUES (1, 'founder', 997, 'paid')`).run();
+  db.prepare(`INSERT INTO invoices (client_id, plan, amount, status) VALUES (2, 'founder', 997, 'paid')`).run();
+  db.prepare(`INSERT INTO invoices (client_id, plan, amount, status) VALUES (3, 'growth', 397, 'paid')`).run();
+}
+
+function q(sql) {
+  try {
+    if (sql.trim().toUpperCase().startsWith('SELECT')) return db.prepare(sql.replace(/'/g, "''")).all();
+    else { db.prepare(sql.replace(/'/g, "''")).run(); return []; }
+  } catch(e) { console.error('DB:', e.message); return []; }
+}
+
+app.post('/api/clients/login', (req, res) => {
+  const c = q(`SELECT * FROM clients WHERE email='${req.body.email}' AND password='${req.body.password}'`);
+  if (!c.length) return res.status(401).json({ error: 'Invalid' });
+  res.json(c[0]);
+});
+
+app.get('/api/clients/:id/content', (req, res) => {
+  res.json(q(`SELECT * FROM content_posts WHERE client_id=${req.params.id} ORDER BY created_at DESC`));
+});
+
+app.post('/api/clients/:id/generate-content', (req, res) => {
+  const clients = q(`SELECT * FROM clients WHERE id=${req.params.id}`);
+  if (!clients.length) return res.status(404).json({ error: 'Not found' });
+  const { generateContent } = require('./content-generator');
+  const profiles = q(`SELECT * FROM business_profiles WHERE client_id=${req.params.id}`);
+  const posts = generateContent({
+    business_name: clients[0].business_name,
+    business_type: clients[0].business_type,
+    platforms: profiles[0]?.platforms
+  });
   for (const post of posts) {
-    const sql = `INSERT INTO content_posts (client_id, platform, post_type, caption, hashtags, image_prompt, status) VALUES (${clientId}, '${post.platform}', '${post.post_type}', '${post.caption.replace(/'/g, "''")}', '${post.hashtags}', '${post.image_prompt}', 'draft')`;
-    await new Promise(r => exec(`team-db "${sql}"`, () => r()));
+    q(`INSERT INTO content_posts (client_id, platform, post_type, caption, hashtags, image_prompt, status) VALUES (${req.params.id}, '${post.platform}', '${post.post_type}', '${post.caption.replace(/'/g, "''")}', '${post.hashtags}', '${post.image_prompt}', 'draft')`);
   }
-  return posts;
-}
+  res.json(q(`SELECT * FROM content_posts WHERE client_id=${req.params.id} ORDER BY created_at DESC`));
+});
 
-function generateSinglePost(name, type, platform, day) {
-  const t = (type || '').toLowerCase();
-  const types = t.includes('fitness') ?
-    ['Workout Tip','Nutrition','Transformation','Motivation','Educational','Promotional','Tips'] :
-    t.includes('restaurant') || t.includes('ramen') ?
-    ['Food Feature','Behind Scenes','Specials','Culture','Educational','Promotional','Engagement'] :
-    t.includes('physical therapy') || t.includes('pt') ?
-    ['Exercise','Injury Prevention','Success Story','Tips','Educational','Promotional','Inspirational'] :
-    ['Educational','Promotional','Behind Scenes','Inspirational','Testimonial','Tips','Engagement'];
-  const pt = types[day % types.length];
+app.get('/api/clients/:id/profile', (req, res) => {
+  res.json(q(`SELECT * FROM business_profiles WHERE client_id=${req.params.id}`)[0] || {});
+});
 
-  if (t.includes('fitness')) {
-    if (pt === 'Workout Tip') return { platform, post_type: pt, caption: `Struggling with your form? Quality beats quantity. At ${name}, we prioritize safety. What exercise are you working on?`, hashtags: '#fitness #workouttips #gymmotivation', image_prompt: 'A fitness coach demonstrating proper form' };
-    if (pt === 'Nutrition') return { platform, post_type: pt, caption: `Fuel your body right! At ${name}, we believe balanced nutrition is key. What's your go-to post-workout snack?`, hashtags: '#nutrition #healthyeating #fitness', image_prompt: 'A colorful healthy meal' };
-    if (pt === 'Transformation') return { platform, post_type: pt, caption: `Check out this progress! Consistency is everything at ${name}. Ready to start your journey? DM us!`, hashtags: '#transformation #fitnessgoals #results', image_prompt: 'Split screen fitness progress photo' };
-    return { platform, post_type: pt, caption: `Motivation from ${name}! The best time to start was yesterday. The second best is NOW. Let's go!`, hashtags: '#motivation #fitness #nodaysoff', image_prompt: 'Person tying running shoes' };
+app.post('/api/clients/:id/profile', (req, res) => {
+  const b = req.body;
+  const e = q(`SELECT id FROM business_profiles WHERE client_id=${req.params.id}`);
+  if (e.length) q(`UPDATE business_profiles SET website='${b.website||''}',brand_voice='${b.brand_voice||''}',target_audience='${b.target_audience||''}',platforms='${b.platforms||''}',content_style='${b.content_style||''}' WHERE client_id=${req.params.id}`);
+  else q(`INSERT INTO business_profiles (client_id,website,brand_voice,target_audience,platforms,content_style) VALUES (${req.params.id},'${b.website||''}','${b.brand_voice||''}','${b.target_audience||''}','${b.platforms||''}','${b.content_style||''}')`);
+  res.json({ message: 'Saved' });
+});
+
+app.put('/api/content/:id', (req, res) => {
+  if (req.body.status) q(`UPDATE content_posts SET status='${req.body.status}' WHERE id=${req.params.id}`);
+  res.json({ message: 'Updated' });
+});
+
+app.delete('/api/content/:id', (req, res) => {
+  q(`DELETE FROM content_posts WHERE id=${req.params.id}`);
+  res.json({ message: 'Deleted' });
+});
+
+app.post('/api/signup', (req, res) => {
+  q(`INSERT INTO signups (email) VALUES ('${req.body.email}')`);
+  res.json({ message: 'Signup successful' });
+});
+
+app.post('/api/checkout', async (req, res) => {
+  const { client_id, plan } = req.body;
+  const prices = { starter: 197, growth: 397, founder: 997 };
+  const amt = prices[plan] || 997;
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
+  if (stripeKey && stripeKey.startsWith('sk_')) {
+    try {
+      const stripe = require('stripe')(stripeKey);
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        line_items: [{ price_data: { currency: 'usd', product_data: { name: plan }, unit_amount: amt * 100 }, quantity: 1 }],
+        mode: 'payment',
+        success_url: 'https://landing-page-eta-neon.vercel.app/portal?success=1',
+        cancel_url: 'https://landing-page-eta-neon.vercel.app/pricing'
+      });
+      q(`INSERT INTO payments (client_id, plan, amount, status) VALUES (${client_id}, '${plan}', ${amt}, 'pending')`);
+      return res.json({ url: session.url });
+    } catch(e) { return res.status(500).json({ error: e.message }); }
   }
+  q(`INSERT INTO payments (client_id, plan, amount, status) VALUES (${client_id}, '${plan}', ${amt}, 'completed')`);
+  q(`INSERT INTO invoices (client_id, plan, amount, status) VALUES (${client_id}, '${plan}', ${amt}, 'paid')`);
+  res.json({ success: true, message: `${plan} confirmed! $${amt}` });
+});
 
-  if (t.includes('restaurant') || t.includes('ramen')) {
-    if (pt === 'Food Feature') return { platform, post_type: pt, caption: `Have you tried our signature dish? At ${name}, every ingredient counts. Come taste the difference!`, hashtags: '#foodie #restaurant #delicious', image_prompt: 'Steaming bowl of ramen' };
-    if (pt === 'Behind Scenes') return { platform, post_type: pt, caption: `Behind the scenes at ${name}! Our team starts early to bring you perfection in every bite.`, hashtags: '#behindthescenes #kitchen #chef', image_prompt: 'Chef preparing ingredients' };
-    if (pt === 'Specials') return { platform, post_type: pt, caption: `New specials at ${name}! Limited time flavors you don't want to miss. Tag a friend to bring!`, hashtags: '#specials #limitedtime #foodlovers', image_prompt: 'Beautiful plate of food with chalkboard sign' };
-    return { platform, post_type: pt, caption: `${name} is more than food - it's community. What's your favorite memory with us?`, hashtags: '#restaurant #community #foodculture', image_prompt: 'Friends laughing over dinner' };
-  }
+app.get('/api/payments/:clientId', (req, res) => {
+  res.json(q(`SELECT * FROM payments WHERE client_id=${req.params.clientId} ORDER BY created_at DESC`));
+});
 
-  if (t.includes('physical therapy') || t.includes('pt')) {
-    if (pt === 'Exercise') return { platform, post_type: pt, caption: `Mobility is key! Try this exercise from ${name}. 3 sets of 10 - your joints will thank you!`, hashtags: '#physicaltherapy #mobility #rehab', image_prompt: 'PT guiding patient through exercise' };
-    if (pt === 'Injury Prevention') return { platform, post_type: pt, caption: `Prevention is better than cure. At ${name}, we help you stay healthy and active.`, hashtags: '#injuryprevention #wellness #physio', image_prompt: 'Person stretching properly' };
-    if (pt === 'Success Story') return { platform, post_type: pt, caption: `From pain to progress! Another success story at ${name}. Your goals are our goals.`, hashtags: '#recovery #physicaltherapy #success', image_prompt: 'Smiling patient giving thumbs up' };
-    return { platform, post_type: pt, caption: `Posture tip from ${name}: Keep shoulders back and down. Small changes, big results!`, hashtags: '#posture #backpain #physiotips', image_prompt: 'Infographic of proper sitting posture' };
-  }
-
-  return { platform, post_type: pt, caption: `Welcome to ${name}! We provide top-tier ${type} services. How can we help you today?`, hashtags: `#${name.replace(/\s+/g,'')} #${type.replace(/\s+/g,'')} #localbusiness`, image_prompt: `Professional representation of a ${type} business` };
-}
-
-module.exports = { generateContent };
+app.listen(port, '0.0.0.0', () => console.log(`AutoSocial AI on :${port}`));
